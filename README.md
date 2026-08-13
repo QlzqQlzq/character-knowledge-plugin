@@ -11,7 +11,7 @@
 
 ## Configuration
 
-编辑 `config.toml`，或在 MaiBot WebUI 中配置。默认启用 AnimeTrace 联网检索；视觉服务和本地角色库默认关闭，且不包含任何 API Key。
+在 MaiBot WebUI 中配置插件。默认启用 AnimeTrace 联网检索，视觉服务和本地角色库默认关闭，且不包含任何 API Key。
 
 ```toml
 [vision]

@@ -63,7 +63,8 @@ def _multipart_body(image_bytes: bytes, mime_type: str) -> tuple[bytes, str]:
 
 
 async def search_anime_trace(
-    *, image_bytes: bytes, base_url: str, timeout_seconds: int, max_upload_bytes: int = 900_000
+    *, image_bytes: bytes, base_url: str, timeout_seconds: int, max_upload_bytes: int = 900_000,
+    max_candidates: int = 3,
 ) -> tuple[ReverseImageHint, ...]:
     """Return untrusted AnimeTrace candidates for a VLM to verify visually.
 
@@ -116,4 +117,6 @@ async def search_anime_trace(
                     "AnimeTrace", f"{name}｜{franchise}｜{confidence}", name, franchise, not_confident
                 )
             )
-    return tuple(candidates[:12])
+    confident = [candidate for candidate in candidates if not candidate.not_confident]
+    uncertain = [candidate for candidate in candidates if candidate.not_confident]
+    return tuple((confident + uncertain)[:max_candidates])

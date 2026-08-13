@@ -77,5 +77,5 @@ class VisionResult:
             description=description,
             is_anime_character=is_anime_character,
             candidate=candidates[0] if candidates else None,
-            candidates=candidates[:6],
+            candidates=candidates[:10],
         )

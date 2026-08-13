@@ -1,12 +1,12 @@
 # MaiBot Character Knowledge Plugin
 
-通过 AnimeTrace 等联网 API 以及本地角色库为图片补充角色标签的 MaiBot SDK v2 插件。
+复用 MaiBot 的 VLM 图片描述，通过 AnimeTrace 等联网 API 以及可选本地角色库为图片补充角色标签的 MaiBot SDK v2 插件。
 
 示例：
 
 ```text
-[图片：二次元角色图片，联网候选：アロナ] 图片[アロナ]
-[图片：二次元角色图片，联网候选：プラナ] 图片[プラナ]
+[图片：蓝白发少女站在教室中，头顶有发光圆环。] 图片[アロナ]
+[图片：白发少女穿黑色制服，头顶有深色圆环。] 图片[プラナ]
 ```
 
 ## Configuration
@@ -37,7 +37,11 @@ anime_trace_max_upload_bytes = 900000
 timeout_seconds = 15
 ```
 
-本插件内置可调用的 Gemini 或 OpenAI-compatible VLM。启用后，图片会跳过MaiBot 内置 VLM 而是发送到这里配置的 `base_url`，并使用这里的 `api_key` 和 `model`。
+`plugin.max_characters_per_image` 控制单张图片最多保留的角色候选数，默认 3，可设置为 1–10；多人图较多时可以适当调高。
+
+默认模式通过 SDK 的 `llm.generate` capability 调用 MaiBot 已配置的 `vlm` 任务生成通用图片描述，不需要在插件里重复填写模型密钥。
+
+本插件也内置可单独配置的 Gemini 或 OpenAI-compatible VLM。启用后，它会代替默认描述调用，并额外负责二次元人物判断和本地角色库匹配；图片会发送到这里配置的 `base_url`，并使用这里的 `api_key` 和 `model`。
 
 `anime_trace_enabled` 启用后，图片会上传到 AnimeTrace 用于二次元角色检索。图片会自动为该请求创建压缩副本，原图不会被改写。
 
@@ -55,17 +59,17 @@ plugin VLM: describe image + classify anime character + check private library
 
 该模式由插件的 VLM 产生通用图片描述并替换图片文本，可避免 MaiBot 内置 VLM 再次识图。适合需要本地角色库的场景。
 
-### Lightweight Online Mode
+### MaiBot VLM + Online Mode
 
 `vision.enabled = false` 且 `anime_trace_enabled = true` 时：
 
 ```text
-AnimeTrace lookup
-  -> match: keep original image and append [角色识别：图片[角色]]
-  -> no match: keep original image unchanged
+MaiBot vlm task and AnimeTrace run in parallel
+  -> match: output [图片：MaiBot VLM 描述] 图片[角色]
+  -> no match: output [图片：MaiBot VLM 描述] 图片[未识别]
 ```
 
-因此未识别图片、真人和非人物图仍会交给 MaiBot 内置 VLM，并保留它原有的图片提示词与描述能力。
+插件沿用 MaiBot 的图片描述提示词风格。未识别图片、真人和非人物图仍会获得普通图片描述；AnimeTrace 只负责补充角色标签，不会替代通用描述。
 
 AnimeTrace 仅接受其返回的明确角色候选；低置信候选不会自动写入标签。多人图会保留多个明确角色标签，例如 `图片[角色A、角色B]`。
 
@@ -103,10 +107,10 @@ admin_qq = ["123456789"]
 
 - `max_images_per_message` 默认 4，超过的图片不会由插件请求外部服务。
 - `max_concurrency` 默认 1，避免大量图片同时触发限流。
-- `message_timeout_seconds` 默认 110 秒；超时或单张识别失败的图片会原样交给 MaiBot 内置 VLM。
+- `message_timeout_seconds` 默认 110 秒；默认模式中的 MaiBot VLM 与 AnimeTrace 并行执行，超时或描述失败时图片会原样交还 MaiBot 后续链路。
 - 相同图片按哈希进行有界、限时缓存，避免重复请求和内存持续增长。
 - 缓存优先使用 MaiBot 提供的 SHA-256 图片唯一 ID；字段缺失时按图片内容计算 SHA-256，QQ 与 WebUI 可复用同一逻辑。
-- 发送给插件视觉服务和 AnimeTrace 的图片副本都有独立的体积上限，超限时会缩放并转为 JPEG。
+- 发送给 MaiBot VLM、插件视觉服务和 AnimeTrace 的图片副本都有体积上限，超限时会缩放并转为 JPEG。
 - 视觉服务或 AnimeTrace 连续失败 2 次后会暂停请求 60 秒，随后自动恢复尝试。
 - 开启 `vision` 时，图片会发送给你配置的视觉服务。
 - 开启 AnimeTrace 时，图片会发送给 AnimeTrace。

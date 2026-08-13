@@ -9,6 +9,12 @@ from .models import VisionResult
 from .reverse_image import prepare_anime_trace_image
 
 
+HOST_IMAGE_DESCRIPTION_PROMPT = (
+    "请用中文详细描述这张图片的内容。如果有文字，请把文字描述概括出来，请留意其主题、直观感受，"
+    "输出为一段平文本，最多100字，请注意不要分点，就输出一段文本"
+)
+
+
 def detect_image_mime_type(image_bytes: bytes) -> str:
     if image_bytes.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
@@ -19,14 +25,43 @@ def detect_image_mime_type(image_bytes: bytes) -> str:
     return "image/png"
 
 
-def build_prompt(private_catalog: list[dict[str, object]]) -> str:
+async def describe_with_host_vlm(*, llm: Any, image_bytes: bytes, max_upload_bytes: int) -> str:
+    """Use MaiBot's configured VLM task with its built-in image-description prompt."""
+
+    upload, mime_type = prepare_anime_trace_image(image_bytes, max_bytes=max_upload_bytes)
+    image_format = mime_type.removeprefix("image/")
+    response = await llm.generate(
+        prompt=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": HOST_IMAGE_DESCRIPTION_PROMPT},
+                    {
+                        "type": "image",
+                        "image_format": image_format,
+                        "image_base64": base64.b64encode(upload).decode("ascii"),
+                    },
+                ],
+            }
+        ],
+        model="vlm",
+        temperature=0,
+        max_tokens=220,
+    )
+    if not isinstance(response, dict) or not response.get("success", False):
+        return ""
+    description = str(response.get("response") or "").strip()
+    return description[:160]
+
+
+def build_prompt(private_catalog: list[dict[str, object]], max_candidates: int = 3) -> str:
     catalog = json.dumps(private_catalog, ensure_ascii=False, separators=(",", ":"))
     return (
         "识别图片中的主要人物角色。只输出 JSON，不要 Markdown。\n"
         "格式：{\"description\":\"不超过100字的客观中文图片描述\",\"is_anime_character\":true,\"candidates\":["
-        "{\"kind\":\"private|public|unknown\",\"name\":\"\",\"franchise\":\"\",\"evidence\":[\"最多3条可见特征\"],\"conflicts\":[\"冲突特征\"]}]}。\n"
-        "每个可区分人物对应一个候选，最多6个；private 只能从本地角色库中逐字选择 name；看不清、没有人物或没有足够证据时使用空 candidates。"
-        "不要猜测，不要把风格或相似度当成证据。public 仅在你对角色名和作品名都有明确把握时使用。\n"
+        "{\"kind\":\"private|unknown\",\"name\":\"\",\"franchise\":\"\",\"evidence\":[\"最多3条可见特征\"],\"conflicts\":[\"冲突特征\"]}]}。\n"
+        f"每个可区分人物对应一个候选，最多{max_candidates}个；private 只能从本地角色库中逐字选择 name；看不清、没有人物或没有足够证据时使用空 candidates。"
+        "不要凭模型记忆猜公共角色名，不要把风格或相似度当成证据；不在本地角色库中的人物必须使用 unknown。\n"
         "输出额外字段 is_anime_character：仅当图片主体是二次元、动画或游戏风格人物时为 true；真人、风景、物品、文字梗图和非人物图片必须为 false。\n"
         f"本地角色库：{catalog}"
     )
@@ -42,9 +77,10 @@ async def identify_image(
     private_catalog: list[dict[str, object]],
     timeout_seconds: int,
     max_upload_bytes: int = 4_194_304,
+    max_candidates: int = 3,
 ) -> VisionResult | None:
     image_bytes, _ = prepare_anime_trace_image(image_bytes, max_bytes=max_upload_bytes)
-    prompt = build_prompt(private_catalog)
+    prompt = build_prompt(private_catalog, max_candidates)
     if provider == "gemini":
         content = await _call_gemini(api_key, base_url, model, prompt, image_bytes, timeout_seconds)
     elif provider == "openai":

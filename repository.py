@@ -41,7 +41,12 @@ class CharacterRepository:
             )
         self._characters = tuple(characters)
 
-    def private_catalog(self) -> list[dict[str, object]]:
+    def ensure_exists(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._path.exists():
+            self._write({"characters": []})
+
+    def private_catalog(self, *, limit: int = 40) -> list[dict[str, object]]:
         return [
             {
                 "id": character.character_id,
@@ -49,8 +54,14 @@ class CharacterRepository:
                 "aliases": list(character.aliases),
                 "appearance_cards": list(character.appearance_cards),
             }
-            for character in self._characters
+            for character in self._characters[:limit]
         ]
+
+    def _write(self, raw: dict[str, object]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+        temporary.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self._path)
 
     def find_name(self, proposed_name: str) -> Character | None:
         normalized = proposed_name.strip().casefold()
@@ -90,7 +101,7 @@ class CharacterRepository:
             }
         )
         raw["characters"] = entries
-        self._path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write(raw)
         self.reload()
         character = self.find_name(normalized_name)
         if character is None:
@@ -130,7 +141,7 @@ class CharacterRepository:
                 seen.add(key)
                 merged.append(normalized_card)
         target["appearance_cards"] = merged[:limit]
-        self._path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write(raw)
         self.reload()
         character = self.find_name(normalized_name)
         if character is None:
@@ -195,7 +206,7 @@ class CharacterRepository:
         if target is None:
             raise ValueError(f"角色库中不存在“{normalized_name}”")
         update(target)
-        self._path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write(raw)
         self.reload()
         character = self.find_name(str(target.get("name") or ""))
         if character is None:

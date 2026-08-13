@@ -25,6 +25,8 @@ model = "gemini-3-flash"
 enabled = false
 file_name = "characters.json"
 admin_qq = []
+allow_unrestricted_admin = false
+max_prompt_characters = 40
 
 [reverse_image]
 anime_trace_enabled = true
@@ -67,7 +69,7 @@ AnimeTrace 仅接受其返回的明确角色候选；低置信候选不会自动
 
 ## Private Character Library
 
-启用 `[library].enabled` 后，插件从 `data/characters.json` 读取管理员维护的角色库。关系标签只来自本地库，例如 `图片[角色名]（自己）`。
+启用 `[library].enabled` 后，插件从 MaiBot 为本插件分配的持久化数据目录读取 `characters.json`。插件升级或替换源码目录不会覆盖角色库；旧版本源码目录中的 `data/characters.json` 会在首次启动时自动迁移。关系标签只来自本地库，例如 `图片[角色名]（自己）`。
 
 生产环境应将允许管理角色库的 QQ 号写入：
 
@@ -76,7 +78,7 @@ AnimeTrace 仅接受其返回的明确角色候选；低置信候选不会自动
 admin_qq = ["123456789"]
 ```
 
-留空时不限制管理员，方便 WebUI 本地测试。
+`admin_qq` 留空时，聊天管理命令默认对所有人关闭。仅在受控的本地 WebUI 测试中，可显式设置 `allow_unrestricted_admin = true`；服务器上不应开启它。
 
 ### Commands
 
@@ -98,7 +100,8 @@ admin_qq = ["123456789"]
 
 - `max_images_per_message` 默认 4，超过的图片不会由插件请求外部服务。
 - `max_concurrency` 默认 1，避免大量图片同时触发限流。
-- 相同图片按哈希缓存，避免重复请求。
+- `message_timeout_seconds` 默认 110 秒；超时或单张识别失败的图片会原样交给 MaiBot 内置 VLM。
+- 相同图片按哈希进行有界、限时缓存，避免重复请求和内存持续增长。
 - 开启 `vision` 时，图片会发送给你配置的视觉服务。
 - 开启 AnimeTrace 时，图片会发送给 AnimeTrace。
 - 本地角色库不会因为普通聊天自动新增或修改；只有管理员命令可以写入。

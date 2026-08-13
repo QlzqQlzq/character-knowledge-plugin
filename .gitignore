@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 config_back/
 config.toml
+config.example.toml
+data/
+tests/
+.ruff_cache/

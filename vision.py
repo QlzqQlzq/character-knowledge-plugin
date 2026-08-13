@@ -8,6 +8,16 @@ from urllib.request import Request, urlopen
 from .models import VisionResult
 
 
+def detect_image_mime_type(image_bytes: bytes) -> str:
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"GIF87a") or image_bytes.startswith(b"GIF89a"):
+        return "image/gif"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
 def build_prompt(private_catalog: list[dict[str, object]]) -> str:
     catalog = json.dumps(private_catalog, ensure_ascii=False, separators=(",", ":"))
     return (
@@ -77,7 +87,8 @@ async def build_appearance_cards(
 async def _call_openai(
     api_key: str, base_url: str, model: str, prompt: str, image_bytes: bytes, timeout_seconds: int
 ) -> str:
-    data_url = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    mime_type = detect_image_mime_type(image_bytes)
+    data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
     payload = {
         "model": model,
         "temperature": 0,
@@ -110,7 +121,7 @@ async def _call_gemini(
     url = base_url.rstrip("/") + f"/models/{model}:generateContent?key={api_key}"
     payload = {
         "generationConfig": {"temperature": 0, "maxOutputTokens": 300, "responseMimeType": "application/json"},
-        "contents": [{"role": "user", "parts": [{"text": prompt}, {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(image_bytes).decode("ascii")}}]}],
+        "contents": [{"role": "user", "parts": [{"text": prompt}, {"inlineData": {"mimeType": detect_image_mime_type(image_bytes), "data": base64.b64encode(image_bytes).decode("ascii")}}]}],
     }
     response = await _post_json(url, {}, payload, timeout_seconds)
     candidates = response.get("candidates") if isinstance(response, dict) else None

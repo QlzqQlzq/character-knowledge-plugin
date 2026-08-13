@@ -82,7 +82,10 @@ async def search_anime_trace(
 
     def send() -> dict[str, object]:
         with urlopen(request, timeout=timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+            content = response.read(2_000_001)
+            if len(content) > 2_000_000:
+                raise RuntimeError("AnimeTrace 响应超过 2000000 bytes")
+            return json.loads(content.decode("utf-8"))
 
     response = await asyncio.to_thread(send)
     entries = response.get("data") if isinstance(response, dict) else None

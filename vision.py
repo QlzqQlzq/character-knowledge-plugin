@@ -6,6 +6,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .models import VisionResult
+from .reverse_image import prepare_anime_trace_image
 
 
 def detect_image_mime_type(image_bytes: bytes) -> str:
@@ -22,9 +23,9 @@ def build_prompt(private_catalog: list[dict[str, object]]) -> str:
     catalog = json.dumps(private_catalog, ensure_ascii=False, separators=(",", ":"))
     return (
         "识别图片中的主要人物角色。只输出 JSON，不要 Markdown。\n"
-        "格式：{\"description\":\"不超过100字的客观中文图片描述\",\"is_anime_character\":true,\"kind\":\"private|public|unknown\",\"name\":\"\",\"franchise\":\"\","
-        "\"evidence\":[\"最多3条可见特征\"],\"conflicts\":[\"冲突特征\"]}。\n"
-        "private 只能从本地角色库中逐字选择 name；看不清、多人难分、没有人物或没有足够证据时必须 unknown。"
+        "格式：{\"description\":\"不超过100字的客观中文图片描述\",\"is_anime_character\":true,\"candidates\":["
+        "{\"kind\":\"private|public|unknown\",\"name\":\"\",\"franchise\":\"\",\"evidence\":[\"最多3条可见特征\"],\"conflicts\":[\"冲突特征\"]}]}。\n"
+        "每个可区分人物对应一个候选，最多6个；private 只能从本地角色库中逐字选择 name；看不清、没有人物或没有足够证据时使用空 candidates。"
         "不要猜测，不要把风格或相似度当成证据。public 仅在你对角色名和作品名都有明确把握时使用。\n"
         "输出额外字段 is_anime_character：仅当图片主体是二次元、动画或游戏风格人物时为 true；真人、风景、物品、文字梗图和非人物图片必须为 false。\n"
         f"本地角色库：{catalog}"
@@ -40,7 +41,9 @@ async def identify_image(
     image_bytes: bytes,
     private_catalog: list[dict[str, object]],
     timeout_seconds: int,
+    max_upload_bytes: int = 4_194_304,
 ) -> VisionResult | None:
+    image_bytes, _ = prepare_anime_trace_image(image_bytes, max_bytes=max_upload_bytes)
     prompt = build_prompt(private_catalog)
     if provider == "gemini":
         content = await _call_gemini(api_key, base_url, model, prompt, image_bytes, timeout_seconds)
@@ -62,7 +65,9 @@ async def build_appearance_cards(
     model: str,
     image_bytes: bytes,
     timeout_seconds: int,
+    max_upload_bytes: int = 4_194_304,
 ) -> list[str]:
+    image_bytes, _ = prepare_anime_trace_image(image_bytes, max_bytes=max_upload_bytes)
     prompt = (
         "为管理员创建二次元角色的可维护外观卡。只输出 JSON：{\"appearance_cards\":[\"...\"]}。"
         "给出3到5条中文客观特征，优先发色发型、眼睛、标志性头饰/饰品、稳定服装设计；"
@@ -92,7 +97,7 @@ async def _call_openai(
     payload = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 300,
+        "max_tokens": 650,
         "response_format": {"type": "json_object"},
         "messages": [
             {
@@ -120,7 +125,7 @@ async def _call_gemini(
 ) -> str:
     url = base_url.rstrip("/") + f"/models/{model}:generateContent?key={api_key}"
     payload = {
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 300, "responseMimeType": "application/json"},
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 650, "responseMimeType": "application/json"},
         "contents": [{"role": "user", "parts": [{"text": prompt}, {"inlineData": {"mimeType": detect_image_mime_type(image_bytes), "data": base64.b64encode(image_bytes).decode("ascii")}}]}],
     }
     response = await _post_json(url, {}, payload, timeout_seconds)
@@ -141,9 +146,13 @@ async def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any],
     def send() -> dict[str, Any]:
         try:
             with urlopen(request, timeout=timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
+                content = response.read(2_000_001)
+                if len(content) > 2_000_000:
+                    raise RuntimeError("视觉接口响应超过 2000000 bytes")
+                return json.loads(content.decode("utf-8"))
         except HTTPError as exc:
-            raise RuntimeError(f"视觉接口 HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')[:500]}") from exc
+            detail = exc.read(501).decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"视觉接口 HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"视觉接口连接失败: {exc.reason}") from exc
 

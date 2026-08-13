@@ -52,6 +52,7 @@ class VisionResult:
     description: str
     is_anime_character: bool
     candidate: VisionCandidate | None
+    candidates: tuple[VisionCandidate, ...] = ()
 
     @classmethod
     def from_dict(cls, value: Any) -> "VisionResult | None":
@@ -63,8 +64,18 @@ class VisionResult:
         is_anime_character = value.get("is_anime_character")
         if not isinstance(is_anime_character, bool):
             return None
+        raw_candidates = value.get("candidates")
+        candidates = (
+            tuple(candidate for item in raw_candidates if (candidate := VisionCandidate.from_dict(item)) is not None)
+            if isinstance(raw_candidates, list)
+            else ()
+        )
+        legacy_candidate = VisionCandidate.from_dict(value)
+        if not candidates and legacy_candidate is not None:
+            candidates = (legacy_candidate,)
         return cls(
             description=description,
             is_anime_character=is_anime_character,
-            candidate=VisionCandidate.from_dict(value),
+            candidate=candidates[0] if candidates else None,
+            candidates=candidates[:6],
         )

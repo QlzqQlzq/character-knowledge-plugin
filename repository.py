@@ -87,15 +87,29 @@ class CharacterRepository:
             loaded = json.loads(self._path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and isinstance(loaded.get("characters"), list):
                 raw = loaded
-        entries = [entry for entry in raw["characters"] if isinstance(entry, dict) and entry.get("name") != normalized_name]
+        existing_entry = next(
+            (
+                entry
+                for entry in raw["characters"]
+                if isinstance(entry, dict)
+                and str(entry.get("name") or "").strip().casefold() == normalized_name.casefold()
+            ),
+            None,
+        )
+        for character in self._characters:
+            if character.character_id == str((existing_entry or {}).get("id") or ""):
+                continue
+            if normalized_name.casefold() in {character.name.casefold(), *(alias.casefold() for alias in character.aliases)}:
+                raise ValueError(f"名称“{normalized_name}”已被角色“{character.name}”使用")
+        entries = [entry for entry in raw["characters"] if entry is not existing_entry]
         # Names are commonly Chinese, so an ASCII-only slug would collapse every such
         # entry to the same ID. The digest is stable and collision-resistant in practice.
-        identifier = f"char-{hashlib.sha256(normalized_name.casefold().encode('utf-8')).hexdigest()[:12]}"
+        identifier = str((existing_entry or {}).get("id") or "").strip() or f"char-{hashlib.sha256(normalized_name.casefold().encode('utf-8')).hexdigest()[:12]}"
         entries.append(
             {
                 "id": identifier,
                 "name": normalized_name,
-                "aliases": [],
+                "aliases": list((existing_entry or {}).get("aliases") or []),
                 "relationship": relationship.strip(),
                 "appearance_cards": cards[:5],
             }
@@ -140,7 +154,7 @@ class CharacterRepository:
             if normalized_card and key not in seen:
                 seen.add(key)
                 merged.append(normalized_card)
-        target["appearance_cards"] = merged[:limit]
+        target["appearance_cards"] = merged[-limit:]
         self._write(raw)
         self.reload()
         character = self.find_name(normalized_name)
@@ -158,6 +172,10 @@ class CharacterRepository:
         normalized_alias = alias.strip()
         if not normalized_alias:
             raise ValueError("别名不能为空")
+        conflict = self.find_name(normalized_alias)
+        target = self.find_name(name)
+        if conflict is not None and (target is None or conflict.character_id != target.character_id):
+            raise ValueError(f"名称或别名“{normalized_alias}”已属于角色“{conflict.name}”")
 
         def update(entry: dict[str, object]) -> None:
             aliases = entry.get("aliases")

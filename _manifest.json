@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.QlzqQlzq.character-knowledge-plugin",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "name": "角色知识",
   "description": "通过 AnimeTrace、可选视觉识别和私有角色库为图片补充角色标签。",
   "author": {

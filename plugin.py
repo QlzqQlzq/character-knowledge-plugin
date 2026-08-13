@@ -2,6 +2,8 @@ import asyncio
 import base64
 import binascii
 from collections import OrderedDict
+from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import shutil
 import time
@@ -15,13 +17,19 @@ from .vision import build_appearance_cards, identify_image
 from .reverse_image import ReverseImageHint, search_anime_trace
 
 
+@dataclass
+class ServiceHealth:
+    consecutive_failures: int = 0
+    open_until: float = 0.0
+
+
 class PluginSettings(PluginConfigBase):
     __ui_label__ = "插件"
     __ui_icon__ = "scan-face"
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用图片角色知识注入")
-    config_version: str = Field(default="1.0.2", description="配置版本")
+    config_version: str = Field(default="1.0.3", description="配置版本")
     max_images_per_message: int = Field(default=4, ge=1, le=20, description="单条消息最多识别图片数，超出的图片标记为未识别")
     max_concurrency: int = Field(default=1, ge=1, le=4, description="视觉接口最大并发数")
     timeout_seconds: int = Field(default=25, ge=5, le=120, description="单张图片的视觉接口超时秒数")
@@ -29,6 +37,9 @@ class PluginSettings(PluginConfigBase):
     cache_max_entries: int = Field(default=256, ge=16, le=4096, description="图片识别缓存最大条目数")
     cache_ttl_seconds: int = Field(default=3600, ge=60, le=86400, description="图片识别缓存有效秒数")
     latest_image_max_entries: int = Field(default=64, ge=1, le=512, description="修正功能保留的最近图片最大用户数")
+    latest_image_max_total_bytes: int = Field(default=16777216, ge=1048576, le=268435456, description="最近图片缓存总字节上限")
+    circuit_breaker_failures: int = Field(default=2, ge=1, le=10, description="外部服务连续失败多少次后暂时熔断")
+    circuit_breaker_cooldown_seconds: int = Field(default=60, ge=10, le=3600, description="外部服务熔断冷却秒数")
 
 
 class VisionSettings(PluginConfigBase):
@@ -41,6 +52,7 @@ class VisionSettings(PluginConfigBase):
     api_key: str = Field(default="", description="视觉接口密钥；建议通过服务器上的插件配置填写")
     base_url: str = Field(default="https://generativelanguage.googleapis.com/v1beta", description="Gemini API 根地址，OpenAI 模式填写 API 根地址")
     model: str = Field(default="gemini-3-flash", description="支持视觉输入和 JSON 输出的模型名")
+    max_upload_bytes: int = Field(default=4194304, ge=100000, le=20971520, description="发送给视觉服务前的最大图片字节数")
 
 
 class LibrarySettings(PluginConfigBase):
@@ -53,6 +65,7 @@ class LibrarySettings(PluginConfigBase):
     admin_qq: list[str] = Field(default_factory=list, description="允许通过聊天管理角色库的 QQ 号")
     allow_unrestricted_admin: bool = Field(default=False, description="允许任何用户管理角色库，仅用于受控的 WebUI 本地测试")
     max_prompt_characters: int = Field(default=40, ge=1, le=200, description="单次视觉请求最多携带的本地角色数")
+    pending_addition_ttl_seconds: int = Field(default=300, ge=30, le=3600, description="角色添加等待参考图的有效秒数")
 
 
 class ReverseImageSettings(PluginConfigBase):
@@ -83,7 +96,10 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
         self._latest_recognitions: OrderedDict[tuple[str, str], tuple[bytes, str]] = OrderedDict()
         self._semaphore = asyncio.Semaphore(1)
         self._repository_lock = asyncio.Lock()
-        self._pending_additions: dict[tuple[str, str], tuple[str, str]] = {}
+        self._pending_additions: dict[tuple[str, str], tuple[float, str, str]] = {}
+        self._background_tasks: set[asyncio.Task[tuple[str, str]]] = set()
+        self._config_generation = 0
+        self._service_health = {"vision": ServiceHealth(), "anime_trace": ServiceHealth()}
 
     async def on_load(self) -> None:
         self._reload_repository()
@@ -94,13 +110,23 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
         self._cache.clear()
         self._latest_recognitions.clear()
         self._pending_additions.clear()
+        self._config_generation += 1
+        self._service_health = {"vision": ServiceHealth(), "anime_trace": ServiceHealth()}
+        for task in self._background_tasks:
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
         self.ctx.logger.info("角色知识插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
         del scope, config_data
+        self._config_generation += 1
         self._cache.clear()
         self._latest_recognitions.clear()
-        self._reload_repository()
+        self._pending_additions.clear()
+        async with self._repository_lock:
+            self._reload_repository()
         self._semaphore = asyncio.Semaphore(self.config.plugin.max_concurrency)
         self.ctx.logger.info("角色知识插件配置已更新：version=%s", version)
 
@@ -120,9 +146,15 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
         images = self._image_components(message)
         if not images:
             return None
-        pending = self._pending_additions.pop(self._pending_key(message), None)
+        key = self._pending_key(message)
+        pending = self._pending_additions.pop(key, None)
         if pending is not None:
-            return await self._create_pending_character(message, images, pending)
+            created_at, name, relationship = pending
+            if time.monotonic() - created_at <= self.config.library.pending_addition_ttl_seconds:
+                return await self._create_pending_character(message, images, (created_at, name, relationship))
+            stream_id = str(message.get("session_id") or "") if isinstance(message, dict) else ""
+            if stream_id:
+                await self.ctx.send.text("角色添加已超时，本次图片将按普通图片处理。", stream_id)
         replacements = await self._build_replacements(message, images)
         modified = dict(message)
         components = list(modified.get("raw_message") or [])
@@ -141,15 +173,21 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
         self, message: dict[str, Any], images: list[dict[str, Any]]
     ) -> list[list[dict[str, Any]]]:
         limit = self.config.plugin.max_images_per_message
-        tasks = [asyncio.create_task(self._recognize_limited(image)) for image in images[:limit]]
-        done, pending = await asyncio.wait(tasks, timeout=self.config.plugin.message_timeout_seconds)
+        generation = self._config_generation
+        tasks = [asyncio.create_task(self._recognize_limited(image, generation)) for image in images[:limit]]
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=self.config.plugin.message_timeout_seconds)
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    self._track_background_task(task)
+            raise
         if pending:
             self.ctx.logger.warning(
                 "单条消息图片识别超过总预算，%s 张未完成图片将原样交给 MaiBot", len(pending)
             )
             for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+                self._track_background_task(task)
         recognized: list[tuple[str, str] | None] = []
         for task in tasks:
             if task not in done:
@@ -181,9 +219,27 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                 replacements.append([image, {"type": "text", "data": f"[角色识别：{label}]"}])
         return replacements
 
-    async def _recognize_limited(self, image: dict[str, Any]) -> tuple[str, str]:
+    async def _recognize_limited(self, image: dict[str, Any], generation: int) -> tuple[str, str]:
         async with self._semaphore:
-            return await self._recognize_image(image)
+            result = await self._recognize_image(image)
+            if generation != self._config_generation:
+                return "图片识别失败", "图片[未识别]"
+            return result
+
+    def _track_background_task(self, task: asyncio.Task[tuple[str, str]]) -> None:
+        if task in self._background_tasks:
+            return
+        self._background_tasks.add(task)
+        task.add_done_callback(self._finish_background_recognition)
+
+    def _finish_background_recognition(self, task: asyncio.Task[tuple[str, str]]) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            self.ctx.logger.warning("后台图片识别异常: %s", exc)
 
     @Command(
         "character_add",
@@ -205,9 +261,23 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
         relationship = str(matched.get("relationship") or "").strip() if isinstance(matched, dict) else ""
         if not name:
             return await self._command_feedback(stream_id, "用法：/角色添加 名字 [关系]，然后发送一张参考图。", success=False)
-        self._pending_additions[self._pending_key(raw_message)] = (name, relationship)
+        self._discard_expired_additions()
+        self._pending_additions[self._pending_key(raw_message)] = (time.monotonic(), name, relationship)
+        while len(self._pending_additions) > self.config.plugin.latest_image_max_entries:
+            self._pending_additions.pop(next(iter(self._pending_additions)))
         prompt = f"已准备创建“{name}”。请在本聊天单独发送一张参考图，下一条带图消息会用于建库。"
         return await self._command_feedback(stream_id, prompt, success=True)
+
+    @Command("character_add_cancel", description="取消当前聊天中等待参考图的角色添加。", pattern=r"^/取消角色添加\s*$", timeout_ms=5000)
+    async def cancel_character_add(self, message: Any = None, **kwargs: Any) -> tuple[bool, str, int]:
+        del kwargs
+        raw_message = message if isinstance(message, dict) else {}
+        stream_id = str(raw_message.get("session_id") or "")
+        if not self._is_admin(raw_message):
+            return await self._command_feedback(stream_id, "没有角色库管理权限。", success=False)
+        removed = self._pending_additions.pop(self._pending_key(raw_message), None)
+        text = "已取消等待中的角色添加。" if removed is not None else "当前没有等待参考图的角色添加。"
+        return await self._command_feedback(stream_id, text, success=True)
 
     @Command(
         "character_correct",
@@ -226,8 +296,10 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
             return await self._command_feedback(stream_id, "没有角色库管理权限。", success=False)
         matched = kwargs.get("matched_groups")
         name = str(matched.get("name") or "").strip() if isinstance(matched, dict) else ""
-        if not name or not self._repository or self._repository.find_name(name) is None:
+        target = self._repository.find_name(name) if name and self._repository else None
+        if target is None:
             return await self._command_feedback(stream_id, f"角色库中不存在“{name}”。", success=False)
+        canonical_name = target.name
         try:
             image_bytes, old_label = await self._image_for_correction(raw_message)
             async with self._semaphore:
@@ -238,11 +310,12 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                     model=self.config.vision.model,
                     image_bytes=image_bytes,
                     timeout_seconds=self.config.plugin.timeout_seconds,
+                    max_upload_bytes=self.config.vision.max_upload_bytes,
                 )
             async with self._repository_lock:
-                character = self._repository.append_appearance_cards(name=name, appearance_cards=cards)
+                character = self._repository.append_appearance_cards(name=canonical_name, appearance_cards=cards)
         except Exception as exc:
-            self.ctx.logger.warning("引用图片修正角色库失败: name=%s error=%s", name, exc)
+            self.ctx.logger.warning("引用图片修正角色库失败: name=%s error=%s", canonical_name, exc)
             return await self._command_feedback(stream_id, "引用图片修正失败，详情见日志。", success=False)
         self._invalidate_recognition_cache()
         self.ctx.logger.info("管理员引用图片修正角色库成功: name=%s cards=%s", character.name, len(character.appearance_cards))
@@ -388,7 +461,17 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                 self.ctx.logger.warning("迁移旧式角色库失败，将使用空角色库: %s", exc)
         repository = CharacterRepository(path)
         repository.ensure_exists()
-        repository.reload()
+        try:
+            repository.reload()
+        except (OSError, ValueError) as exc:
+            backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            try:
+                path.replace(backup)
+                self.ctx.logger.error("角色库损坏，已备份到 %s 并创建空角色库: %s", backup, exc)
+                repository.ensure_exists()
+                repository.reload()
+            except OSError:
+                raise RuntimeError(f"角色库损坏且无法备份: {path}") from exc
         self._repository = repository
 
     @staticmethod
@@ -405,15 +488,27 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
             return False
         return self._pending_key(message)[1] in allowed
 
+    def _discard_expired_additions(self) -> None:
+        now = time.monotonic()
+        ttl = self.config.library.pending_addition_ttl_seconds
+        expired = [key for key, (created_at, _, _) in self._pending_additions.items() if now - created_at > ttl]
+        for key in expired:
+            self._pending_additions.pop(key, None)
+
     async def _create_pending_character(
-        self, message: dict[str, Any], images: list[dict[str, Any]], pending: tuple[str, str]
+        self, message: dict[str, Any], images: list[dict[str, Any]], pending: tuple[float, str, str]
     ) -> dict[str, Any]:
-        name, relationship = pending
+        created_at, name, relationship = pending
         stream_id = str(message.get("session_id") or "")
         if not self._is_admin(message) or not self._repository:
             if stream_id:
                 await self.ctx.send.text("角色库创建权限失效，已取消。", stream_id)
             return {"action": "abort", "custom_result": {"reason": "角色库创建权限失效"}}
+        if len(images) != 1:
+            self._pending_additions[self._pending_key(message)] = pending
+            if stream_id:
+                await self.ctx.send.text("请单独发送一张参考图；角色添加仍在等待中。", stream_id)
+            return {"action": "abort", "custom_result": {"reason": "角色添加需要单张参考图"}}
         encoded = images[0].get("binary_data_base64")
         if not isinstance(encoded, str) or not encoded:
             if stream_id:
@@ -429,13 +524,16 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                     model=self.config.vision.model,
                     image_bytes=image_bytes,
                     timeout_seconds=self.config.plugin.timeout_seconds,
+                    max_upload_bytes=self.config.vision.max_upload_bytes,
                 )
             async with self._repository_lock:
                 self._repository.upsert(name=name, relationship=relationship, appearance_cards=cards)
         except Exception as exc:
             self.ctx.logger.warning("创建角色库条目失败: %s", exc)
+            if time.monotonic() - created_at <= self.config.library.pending_addition_ttl_seconds:
+                self._pending_additions[self._pending_key(message)] = pending
             if stream_id:
-                await self.ctx.send.text("创建角色库条目失败，详情见日志。", stream_id)
+                await self.ctx.send.text("创建角色库条目失败，仍可在有效期内重新发送一张参考图；详情见日志。", stream_id)
             return {"action": "abort", "custom_result": {"reason": "创建角色库条目失败"}}
         self.ctx.logger.info("管理员创建角色库条目成功: name=%s relationship=%s", name, relationship)
         self._invalidate_recognition_cache()
@@ -486,11 +584,9 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                 return reference_id
         return ""
 
-    async def _recognize_image(self, image: dict[str, Any]) -> tuple[str, str]:
+    async def _recognize_image(self, image: dict[str, Any], *, generation: int | None = None) -> tuple[str, str]:
+        generation = self._config_generation if generation is None else generation
         image_hash = str(image.get("hash") or "").strip()
-        cached = self._cache_get(image_hash)
-        if cached is not None:
-            return cached
         encoded = image.get("binary_data_base64")
         if not isinstance(encoded, str) or not encoded:
             return "图片未能读取", "图片[未识别]"
@@ -498,31 +594,44 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
             image_bytes = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error):
             return "图片未能读取", "图片[未识别]"
+        if not image_hash:
+            image_hash = hashlib.sha256(image_bytes).hexdigest()
+        cache_key = f"{generation}:{image_hash}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         catalog = (
             self._repository.private_catalog(limit=self.config.library.max_prompt_characters)
             if self.config.library.enabled and self._repository
             else []
         )
+        if self.config.library.enabled and self._repository:
+            total = len(self._repository.list_characters())
+            if total > len(catalog):
+                self.ctx.logger.warning("本地角色库共 %s 个角色，本次仅有前 %s 个进入视觉提示词", total, len(catalog))
         if not self.config.vision.enabled:
+            anime_trace_was_available = self._service_available("anime_trace")
             reverse_candidates = await self._reverse_search(image_bytes)
             online_label = self._online_label(reverse_candidates)
             recognized = (self._online_description(reverse_candidates), online_label)
-            self._cache_put(image_hash, recognized)
+            if anime_trace_was_available and self._service_health["anime_trace"].consecutive_failures == 0:
+                self._cache_put(cache_key, recognized)
             return recognized
 
         result = await self._identify_with_vision(image_bytes, catalog)
         if result is None:
-            return "图片识别失败", "图片[未识别]"
-        label = self._label_candidate(result.candidate)
+            reverse_candidates = await self._reverse_search(image_bytes)
+            recognized = ("图片识别失败", self._online_label(reverse_candidates))
+            return recognized
+        label = self._label_candidates(result.candidates or ((result.candidate,) if result.candidate else ()))
         if not result.is_anime_character:
             recognized = (result.description, "图片[未识别]")
-            self._cache_put(image_hash, recognized)
+            self._cache_put(cache_key, recognized)
             return recognized
-        if label == "图片[未识别]":
-            reverse_candidates = await self._reverse_search(image_bytes)
-            label = self._online_label(reverse_candidates)
+        reverse_candidates = await self._reverse_search(image_bytes)
+        label = self._merge_labels(label, self._online_label(reverse_candidates))
         recognized = (result.description, label)
-        self._cache_put(image_hash, recognized)
+        self._cache_put(cache_key, recognized)
         return recognized
 
     def _cache_get(self, image_hash: str) -> tuple[str, str] | None:
@@ -551,13 +660,17 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
         self._latest_recognitions.move_to_end(key)
         while len(self._latest_recognitions) > self.config.plugin.latest_image_max_entries:
             self._latest_recognitions.popitem(last=False)
+        while self._latest_recognitions and sum(len(value[0]) for value in self._latest_recognitions.values()) > self.config.plugin.latest_image_max_total_bytes:
+            self._latest_recognitions.popitem(last=False)
 
     def _invalidate_recognition_cache(self) -> None:
         self._cache.clear()
 
     async def _identify_with_vision(self, image_bytes: bytes, catalog: list[dict[str, object]]) -> Any:
+        if not self._service_available("vision"):
+            return None
         try:
-            return await identify_image(
+            result = await identify_image(
                 provider=self.config.vision.provider,
                 api_key=self.config.vision.api_key,
                 base_url=self.config.vision.base_url,
@@ -565,10 +678,46 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                 image_bytes=image_bytes,
                 private_catalog=catalog,
                 timeout_seconds=self.config.plugin.timeout_seconds,
+                max_upload_bytes=self.config.vision.max_upload_bytes,
             )
+            if result is None:
+                raise ValueError("视觉服务返回无效识别结构")
+            self._service_succeeded("vision")
+            return result
         except Exception as exc:
+            self._service_failed("vision", exc)
             self.ctx.logger.warning("图片角色识别失败: %s", exc)
             return None
+
+    def _service_available(self, name: str) -> bool:
+        health = self._service_health[name]
+        if not health.open_until:
+            return True
+        if time.monotonic() < health.open_until:
+            return False
+        health.consecutive_failures = 0
+        health.open_until = 0.0
+        self.ctx.logger.info("外部服务 %s 熔断冷却结束，恢复尝试", name)
+        return True
+
+    def _service_succeeded(self, name: str) -> None:
+        health = self._service_health[name]
+        health.consecutive_failures = 0
+        health.open_until = 0.0
+
+    def _service_failed(self, name: str, error: Exception) -> None:
+        health = self._service_health[name]
+        health.consecutive_failures += 1
+        if health.consecutive_failures < self.config.plugin.circuit_breaker_failures:
+            return
+        health.open_until = time.monotonic() + self.config.plugin.circuit_breaker_cooldown_seconds
+        self.ctx.logger.warning(
+            "外部服务 %s 连续失败 %s 次，熔断 %s 秒: %s",
+            name,
+            health.consecutive_failures,
+            self.config.plugin.circuit_breaker_cooldown_seconds,
+            error,
+        )
 
     @staticmethod
     def _online_label(hints: tuple[ReverseImageHint, ...]) -> str:
@@ -593,6 +742,30 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
             return f"二次元角色图片，联网候选：{'、'.join(names[:6])}"
         return "二次元图片（联网未获得明确角色）"
 
+    @staticmethod
+    def _merge_labels(primary: str, secondary: str) -> str:
+        def names(label: str) -> list[str]:
+            if not label.startswith("图片[") or "]" not in label:
+                return []
+            closing = label.index("]")
+            body = label[3:closing]
+            if body == "未识别":
+                return []
+            suffix = label[closing + 1 :]
+            values = [item.strip() for item in body.split("、") if item.strip()]
+            if suffix and len(values) == 1:
+                values[0] += suffix
+            return values
+
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in [*names(primary), *names(secondary)]:
+            plain = value.split("（", 1)[0].casefold()
+            if plain and plain not in seen:
+                seen.add(plain)
+                merged.append(value)
+        return f"图片[{'、'.join(merged[:6])}]" if merged else "图片[未识别]"
+
     def _label_candidate(self, candidate: Any) -> str:
         if candidate is None or candidate.conflicts or len(candidate.evidence) < 2:
             return "图片[未识别]"
@@ -606,10 +779,17 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
             return "图片[未识别]"
         return f"图片[{candidate.name}]"
 
+    def _label_candidates(self, candidates: tuple[Any, ...]) -> str:
+        labels = [self._label_candidate(candidate) for candidate in candidates[:6]]
+        result = "图片[未识别]"
+        for label in labels:
+            result = self._merge_labels(result, label)
+        return result
+
     async def _reverse_search(self, image_bytes: bytes) -> tuple[ReverseImageHint, ...]:
         settings = self.config.reverse_image
         results: list[ReverseImageHint] = []
-        if settings.anime_trace_enabled:
+        if settings.anime_trace_enabled and self._service_available("anime_trace"):
             try:
                 anime_trace = await search_anime_trace(
                     image_bytes=image_bytes,
@@ -618,6 +798,7 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                     max_upload_bytes=settings.anime_trace_max_upload_bytes,
                 )
                 results.extend(anime_trace)
+                self._service_succeeded("anime_trace")
                 self.ctx.logger.info(
                     "AnimeTrace 返回 %s 个候选: %s",
                     len(anime_trace),
@@ -628,6 +809,7 @@ class CharacterKnowledgePlugin(MaiBotPlugin):
                     or "无",
                 )
             except Exception as exc:
+                self._service_failed("anime_trace", exc)
                 self.ctx.logger.info("AnimeTrace 未获得结果: %s", exc)
         return tuple(results[:20])
 

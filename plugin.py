@@ -29,7 +29,7 @@ class PluginSettings(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用图片角色知识注入")
-    config_version: str = Field(default="1.0.4", description="配置版本")
+    config_version: str = Field(default="1.0.5", description="配置版本")
     max_images_per_message: int = Field(default=4, ge=1, le=20, description="单条消息最多识别图片数，超出的图片标记为未识别")
     max_characters_per_image: int = Field(default=3, ge=1, le=10, description="单张图片最多保留的角色候选数")
     max_concurrency: int = Field(default=1, ge=1, le=4, description="视觉接口最大并发数")
